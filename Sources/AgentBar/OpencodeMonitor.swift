@@ -256,7 +256,7 @@ final class OpencodeMonitor {
                     cmd: cmd,
                     exit: exit,
                     dur: dur,
-                    cwd: cwd,
+                    cwd: cwd ?? details?.directory,
                     tty: nil,
                     ts: Date().timeIntervalSince1970,
                     harness: "opencode",
@@ -306,6 +306,7 @@ final class OpencodeMonitor {
         var title: String?
         var model: String?
         var prompt: String?     // newest user message
+        var directory: String?  // session working directory
     }
 
     private static func fetchDetails(executable: String, sessionID: String) -> SessionDetails {
@@ -315,6 +316,8 @@ final class OpencodeMonitor {
             if let title = session["title"] as? String, !title.isEmpty { details.title = title }
             if let model = session["model"] as? [String: Any],
                let id = model["id"] as? String, !id.isEmpty { details.model = id }
+            if let loc = session["location"] as? [String: Any],
+               let dir = loc["directory"] as? String, !dir.isEmpty { details.directory = dir }
         }
         // Messages come newest first, so the first user message is the latest prompt.
         if let obj = runJSON(executable, ["api", "get", "/api/session/\(sessionID)/message"]),
@@ -331,13 +334,19 @@ final class OpencodeMonitor {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: executable)
         p.arguments = args
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = Pipe()
-        do { try p.run() } catch { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        // The CLI truncates large responses when stdout is a pipe (~8 KB), so
+        // capture into a file instead.
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("agentbar-\(UUID().uuidString).json")
+        guard FileManager.default.createFile(atPath: tmp.path, contents: nil),
+              let out = try? FileHandle(forWritingTo: tmp) else { return nil }
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { try? out.close(); return nil }
         p.waitUntilExit()
-        guard p.terminationStatus == 0,
+        try? out.close()
+        guard let data = try? Data(contentsOf: tmp), p.terminationStatus == 0,
               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
         return obj
     }
