@@ -48,6 +48,7 @@ final class EventStore: ObservableObject {
     /// resets the count, and truncates the log file so the cleared history
     /// doesn't reappear on the next app launch.
     func clearAll() {
+        FileHandle.standardError.write(Data("[agentbar] clearAll: dropping \(events.count) events\n".utf8))
         events = []
         acked = []
         persistAcked()

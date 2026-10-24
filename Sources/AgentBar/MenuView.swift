@@ -24,10 +24,17 @@ struct MenuView: View {
                 Text(headerCountText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Button("Clear") { store.clearAll() }
-                    .buttonStyle(.borderless)
-                    .font(.caption)
-                    .disabled(store.events.isEmpty)
+                Button {
+                    store.clearAll()
+                } label: {
+                    Text("Clear")
+                        .font(.caption)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(store.events.isEmpty)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
@@ -78,9 +85,16 @@ struct MenuView: View {
 
             HStack {
                 Spacer()
-                Button("Quit AgentBar") { NSApp.terminate(nil) }
-                    .buttonStyle(.borderless)
-                    .font(.caption)
+                Button {
+                    NSApp.terminate(nil)
+                } label: {
+                    Text("Quit AgentBar")
+                        .font(.caption)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
