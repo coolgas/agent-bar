@@ -1,0 +1,22 @@
+# AgentBar configuration
+# Installed to ~/.agentbar/config.txt by install.sh.
+# Edits apply within a few seconds — no restart needed.
+#
+#   watch <command prefix>   fire an event when a command starting with this finishes
+#   minDurationSec <n>       minimum runtime in seconds to count (default 5)
+#   maxEvents <n>            events kept in the menu bar list (default 200)
+
+minDurationSec 5
+maxEvents 200
+
+watch grok
+watch claude
+watch codex
+watch gemini
+watch make
+watch cargo
+watch npm run
+watch pnpm
+watch yarn
+watch pytest
+watch opencode run
