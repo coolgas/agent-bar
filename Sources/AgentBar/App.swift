@@ -79,24 +79,11 @@ struct MenuBarLabel: View {
 
     var body: some View {
         Label {
-            Text(labelText)
+            Text(model.store.unackedCount > 0 ? "\(model.store.unackedCount)" : "")
         } icon: {
-            Image(systemName: iconName)
+            Image(systemName: model.store.unackedCount > 0 ? "tray.full.fill" : "tray")
         }
         .help(helpText)
-    }
-
-    // Finished-but-unseen tasks take priority, then running tasks.
-    private var labelText: String {
-        if model.store.unackedCount > 0 { return "\(model.store.unackedCount)" }
-        if model.runningCount > 0 { return "\(model.runningCount)" }
-        return ""
-    }
-
-    private var iconName: String {
-        if model.store.unackedCount > 0 { return "tray.full.fill" }
-        if model.runningCount > 0 { return "gearshape" }
-        return "tray"
     }
 
     private var helpText: String {
