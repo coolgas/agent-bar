@@ -44,6 +44,19 @@ final class EventStore: ObservableObject {
         persistAcked()
     }
 
+    /// Wipes the list entirely: removes every event (acknowledged or not),
+    /// resets the count, and truncates the log file so the cleared history
+    /// doesn't reappear on the next app launch.
+    func clearAll() {
+        events = []
+        acked = []
+        persistAcked()
+        try? FileManager.default.removeItem(at: eventsURL)
+        FileManager.default.createFile(atPath: eventsURL.path, contents: nil)
+        fileOffset = 0
+        pending = ""
+    }
+
     private func loadAcked() {
         guard let data = try? Data(contentsOf: ackedURL),
               let list = try? JSONDecoder().decode([String].self, from: data) else { return }

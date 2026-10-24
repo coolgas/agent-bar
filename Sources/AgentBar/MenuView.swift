@@ -12,10 +12,10 @@ struct MenuView: View {
                 Text(store.unackedCount > 0 ? "\(store.unackedCount) new" : "all clear")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Button("Clear") { store.ackAll() }
+                Button("Clear") { store.clearAll() }
                     .buttonStyle(.borderless)
                     .font(.caption)
-                    .disabled(store.unackedCount == 0)
+                    .disabled(store.events.isEmpty)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
