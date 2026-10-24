@@ -14,6 +14,11 @@ final class ProcessWatcher {
     private var timer: Timer?
     // pid -> (command line, first word, elapsed seconds at last sighting)
     private var tracked: [pid_t: (cmd: String, base: String, elapsed: Int)] = [:]
+    private var lastRunningCount = -1
+
+    /// Called on the main thread whenever the number of live watchlisted
+    /// processes changes (drives the "running" counter in the UI).
+    var onRunningChanged: ((Int) -> Void)?
 
     init(store: EventStore) {
         self.store = store
@@ -30,6 +35,10 @@ final class ProcessWatcher {
         timer?.invalidate()
         timer = nil
         tracked.removeAll()
+        if lastRunningCount != 0 {
+            lastRunningCount = 0
+            onRunningChanged?(0)
+        }
     }
 
     private func scan() {
@@ -70,6 +79,11 @@ final class ProcessWatcher {
         for (pid, info) in tracked where !seen.contains(pid) {
             tracked.removeValue(forKey: pid)
             finish(info)
+        }
+
+        if tracked.count != lastRunningCount {
+            lastRunningCount = tracked.count
+            onRunningChanged?(tracked.count)
         }
     }
 

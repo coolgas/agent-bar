@@ -26,6 +26,12 @@ final class OpencodeMonitor {
     /// Ignore tasks shorter than this — quick Q&A shouldn't page you.
     private let minTaskSeconds = 2
 
+    /// Called on the main thread when the number of executing opencode
+    /// sessions changes (drives the "running" counter).
+    var onBusyChanged: ((Int) -> Void)?
+    /// Called on the main thread for each usage event (tokens/cost delta).
+    var onUsageDelta: ((Usage) -> Void)?
+
     init(store: EventStore) {
         self.store = store
     }
@@ -129,7 +135,10 @@ final class OpencodeMonitor {
         p.terminationHandler = { [weak self] _ in
             guard let self, self.process === p else { return }
             self.process = nil
-            self.queue.async { self.busy.removeAll() }
+            self.queue.async {
+                self.busy.removeAll()
+                self.reportBusy()
+            }
             // Fast exit means something is wrong (bad URL, service down):
             // back off. Slow exit means the service restarted: reconnect fast.
             let delay: TimeInterval = Date().timeIntervalSince(startedAt) < 2 ? 30 : 5
@@ -190,6 +199,7 @@ final class OpencodeMonitor {
         let now = Date()
         if type == "session.execution.started" {
             busy[sessionID] = now
+            reportBusy()
             Self.log("execution started: \(sessionID)")
         } else if type.hasPrefix("session.execution.") {
             // succeeded / failed / interrupted: the task is done
@@ -198,6 +208,7 @@ final class OpencodeMonitor {
                 return
             }
             busy.removeValue(forKey: sessionID)
+            reportBusy()
             let dur = Int(now.timeIntervalSince(started))
             guard dur >= minTaskSeconds else { return }
             let exit = type == "session.execution.succeeded" ? 0 : 1
@@ -233,6 +244,36 @@ final class OpencodeMonitor {
             if let title = payload["title"] as? String, !title.isEmpty {
                 titleCache[sessionID] = title
             }
+        } else if type == "session.usage.updated" {
+            if let usage = Self.parseUsage(payload) {
+                Self.log("usage +\(usage.totalTokens) tokens (cost \(usage.cost))")
+                DispatchQueue.main.async { [weak self] in
+                    self?.onUsageDelta?(usage)
+                }
+            }
+        }
+    }
+
+    /// Each usage event carries the tokens/cost of one model request — they
+    /// accumulate into the daily total.
+    private static func parseUsage(_ payload: [String: Any]) -> Usage? {
+        var usage = Usage(date: Usage.today)
+        usage.cost = payload["cost"] as? Double ?? 0
+        guard let tokens = payload["tokens"] as? [String: Any] else { return nil }
+        usage.input = tokens["input"] as? Int ?? 0
+        usage.output = tokens["output"] as? Int ?? 0
+        usage.reasoning = tokens["reasoning"] as? Int ?? 0
+        if let cache = tokens["cache"] as? [String: Any] {
+            usage.cacheRead = cache["read"] as? Int ?? 0
+        }
+        guard usage.totalTokens > 0 || usage.cost > 0 else { return nil }
+        return usage
+    }
+
+    private func reportBusy() {
+        let count = busy.count
+        DispatchQueue.main.async { [weak self] in
+            self?.onBusyChanged?(count)
         }
     }
 

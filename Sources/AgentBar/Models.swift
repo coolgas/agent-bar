@@ -58,6 +58,54 @@ struct Config {
     }
 }
 
+/// Token usage accumulated for the current day, persisted to
+/// ~/.agentbar/usage.json. Fed by opencode's session.usage.updated events
+/// (each event carries the tokens/cost of one model request).
+struct Usage: Codable, Equatable {
+    var date = ""
+    var input = 0
+    var output = 0
+    var reasoning = 0
+    var cacheRead = 0
+    var cost = 0.0
+
+    static var today: String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: Date())
+    }
+
+    var totalTokens: Int { input + output + reasoning + cacheRead }
+
+    static func load() -> Usage {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".agentbar/usage.json")
+        if let data = try? Data(contentsOf: url),
+           let usage = try? JSONDecoder().decode(Usage.self, from: data),
+           usage.date == today {
+            return usage
+        }
+        return Usage(date: today)   // fresh day (or no/corrupt file)
+    }
+
+    func save() {
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".agentbar", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        if let data = try? JSONEncoder().encode(self) {
+            try? data.write(to: dir.appendingPathComponent("usage.json"), options: .atomic)
+        }
+    }
+
+    mutating func add(_ other: Usage) {
+        input += other.input
+        output += other.output
+        reasoning += other.reasoning
+        cacheRead += other.cacheRead
+        cost += other.cost
+    }
+}
+
 /// Thread-safe config cache that re-reads ~/.agentbar/config.txt whenever its
 /// modification date changes, so edits apply without restarting the app.
 final class ConfigStore {

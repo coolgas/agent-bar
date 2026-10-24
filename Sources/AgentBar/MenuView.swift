@@ -1,7 +1,9 @@
 import SwiftUI
 
 struct MenuView: View {
-    @ObservedObject var store: EventStore
+    @ObservedObject var model: AppModel
+
+    private var store: EventStore { model.store }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -9,7 +11,17 @@ struct MenuView: View {
                 Text("AgentBar")
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
-                Text(store.unackedCount > 0 ? "\(store.unackedCount) new" : "all clear")
+                if model.runningCount > 0 {
+                    HStack(spacing: 3) {
+                        Image(systemName: "gearshape")
+                            .font(.caption2)
+                        Text("\(model.runningCount)")
+                            .font(.caption)
+                    }
+                    .foregroundStyle(.secondary)
+                    .help("running tasks")
+                }
+                Text(headerCountText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("Clear") { store.clearAll() }
@@ -49,6 +61,21 @@ struct MenuView: View {
 
             Divider()
 
+            HStack(spacing: 4) {
+                Image(systemName: "flame.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                Text(usageText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .help("opencode token usage today (all providers tracked by opencode)")
+
+            Divider()
+
             HStack {
                 Spacer()
                 Button("Quit AgentBar") { NSApp.terminate(nil) }
@@ -59,6 +86,20 @@ struct MenuView: View {
             .padding(.vertical, 8)
         }
         .frame(width: 340)
+    }
+
+    private var headerCountText: String {
+        if store.unackedCount > 0 { return "\(store.unackedCount) new" }
+        if model.runningCount == 0 { return "all clear" }
+        return ""
+    }
+
+    private var usageText: String {
+        var text = "Today: \(model.usage.totalTokens.tokensFormatted) tokens"
+        if model.usage.cost > 0 {
+            text += String(format: " · $%.2f", model.usage.cost)
+        }
+        return text
     }
 }
 
