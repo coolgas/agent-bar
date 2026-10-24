@@ -11,17 +11,17 @@ import Foundation
 /// buffers and won't stream).
 final class OpencodeMonitor {
     private let store: EventStore
+    // Main-thread state
     private var process: Process?        // the curl subprocess
-    private var resolvedPath: String?    // opencode binary
+    private var retryWorkItem: DispatchWorkItem?
 
     private let queue = DispatchQueue(label: "agentbar.opencode")
+    // queue-protected state
+    private var resolvedPath: String?    // opencode binary
     private var buffer: [UInt8] = []
-    // queue-protected session state
     private var busy: [String: Date] = [:]           // sessionID -> execution started
-    private var cwdCache: [String: String] = [:]     // sessionID -> directory (from session.created)
+    private var cwdCache: [String: String] = [:]     // sessionID -> directory (event envelope location)
     private var titleCache: [String: String] = [:]   // sessionID -> title (from session.renamed)
-
-    private var retryWorkItem: DispatchWorkItem?
 
     /// Ignore tasks shorter than this — quick Q&A shouldn't page you.
     private let minTaskSeconds = 2
@@ -48,14 +48,14 @@ final class OpencodeMonitor {
         process = nil
     }
 
+    /// Always hops to the main thread so `retryWorkItem` has a single owner.
     private func scheduleRetry(_ delay: TimeInterval) {
-        retryWorkItem?.cancel()
-        let item = DispatchWorkItem { [weak self] in self?.connect() }
-        retryWorkItem = item
-        if delay <= 0 {
-            DispatchQueue.main.async(execute: item)
-        } else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.retryWorkItem?.cancel()
+            let item = DispatchWorkItem { [weak self] in self?.connect() }
+            self.retryWorkItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + max(delay, 0), execute: item)
         }
     }
 
@@ -69,19 +69,19 @@ final class OpencodeMonitor {
                 self.scheduleRetry(30)   // opencode not installed (yet); keep trying
                 return
             }
-            self.resolvedPath = exe
+            self.queue.sync { self.resolvedPath = exe }
             guard let (baseURL, password) = self.discoverService(exe: exe) else {
                 Self.log("service discovery failed; retrying in 15s")
                 self.scheduleRetry(15)   // service not reachable; it may appear later
                 return
             }
             Self.log("opening stream at \(baseURL)")
-            self.openStream(baseURLString: baseURL, password: password)
+            DispatchQueue.main.async { self.openStream(baseURLString: baseURL, password: password) }
         }
     }
 
     private func opencodePath() -> String? {
-        resolvedPath ?? Self.resolveOpencodePath()
+        queue.sync { resolvedPath } ?? Self.resolveOpencodePath()
     }
 
     /// Resolve the opencode binary through a login shell so the app works
@@ -122,27 +122,28 @@ final class OpencodeMonitor {
     private func openStream(baseURLString: String, password: String) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-        p.arguments = [
-            "-sN",                       // silent, unbuffered
-            "-u", "opencode:\(password)",
-            baseURLString + "/api/event",
-        ]
+        p.arguments = ["-sN", "-K", "-"]   // config (URL + credentials) arrives on stdin
         let outPipe = Pipe()
+        let inPipe = Pipe()
         p.standardOutput = outPipe
         p.standardError = Pipe()
+        p.standardInput = inPipe
 
         let startedAt = Date()
         p.terminationHandler = { [weak self] _ in
-            guard let self, self.process === p else { return }
-            self.process = nil
-            self.queue.async {
-                self.busy.removeAll()
-                self.reportBusy()
+            DispatchQueue.main.async {
+                guard let self, self.process === p else { return }
+                self.process = nil
+                self.queue.async {
+                    self.buffer.removeAll()
+                    self.busy.removeAll()
+                    self.reportBusy()
+                }
+                // Fast exit means something is wrong (bad URL, service down):
+                // back off. Slow exit means the service restarted: reconnect fast.
+                let delay: TimeInterval = Date().timeIntervalSince(startedAt) < 2 ? 30 : 5
+                self.scheduleRetry(delay)
             }
-            // Fast exit means something is wrong (bad URL, service down):
-            // back off. Slow exit means the service restarted: reconnect fast.
-            let delay: TimeInterval = Date().timeIntervalSince(startedAt) < 2 ? 30 : 5
-            self.scheduleRetry(delay)
         }
         outPipe.fileHandleForReading.readabilityHandler = { [weak self] fh in
             let data = fh.availableData
@@ -152,14 +153,30 @@ final class OpencodeMonitor {
             }
             self?.queue.async { self?.consume(data) }
         }
+        // Passing the password as an argv (-u) would expose it in `ps`.
+        let config = "user = \"opencode:\(Self.curlEscaped(password))\"\n"
+            + "url = \"\(Self.curlEscaped(baseURLString + "/api/event"))\"\n"
+            + "silent\nno-buffer\n"
         do {
-            try p.run()
+            // Assign before run so a subprocess that exits immediately finds
+            // `process === p` and can reschedule.
             process = p
+            try p.run()
+            inPipe.fileHandleForWriting.write(Data(config.utf8))
+            try? inPipe.fileHandleForWriting.close()
             Self.log("stream running (pid \(p.processIdentifier))")
         } catch {
             Self.log("failed to launch curl: \(error)")
+            process = nil
             scheduleRetry(30)
         }
+    }
+
+    /// Escapes a value for a curl config file string (backslash and quote).
+    private static func curlEscaped(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "")
     }
 
     private static func log(_ message: String) {
@@ -196,6 +213,15 @@ final class OpencodeMonitor {
             return
         }
 
+        // The working directory travels on the event envelope for every
+        // session event, so remember it whenever we see it (not only on
+        // session.created, which we miss for sessions started before launch).
+        if let loc = obj["location"] as? [String: Any],
+           let dir = loc["directory"] as? String, !dir.isEmpty {
+            if cwdCache.count > 200 && cwdCache[sessionID] == nil { cwdCache.removeAll() }
+            cwdCache[sessionID] = dir
+        }
+
         let now = Date()
         if type == "session.execution.started" {
             busy[sessionID] = now
@@ -216,12 +242,13 @@ final class OpencodeMonitor {
             let knownTitle = titleCache[sessionID]
             let exe = resolvedPath
             let sid = sessionID
-            queue.async {
-                var title = knownTitle
-                if title == nil, let exe {
-                    title = Self.fetchTitle(executable: exe, sessionID: sid)
-                }
-                let cmd = "opencode · \(title ?? "session …\(sid.suffix(6))")"
+            // Title lookup shells out to the CLI; keep it off the event queue
+            // so it can't stall processing of the live stream.
+            DispatchQueue.global(qos: .utility).async {
+                let details = exe.map { Self.fetchDetails(executable: $0, sessionID: sid) }
+                let title = knownTitle ?? details?.title
+                let preview = details?.prompt ?? title ?? "session …\(sid.suffix(6))"
+                let cmd = "opencode · \(title ?? preview)"
                 Self.log("emitting task event: \(cmd) (dur \(dur)s, exit \(exit))")
                 EventStore.append(AgentEvent(
                     id: UUID().uuidString,
@@ -231,17 +258,15 @@ final class OpencodeMonitor {
                     dur: dur,
                     cwd: cwd,
                     tty: nil,
-                    ts: Date().timeIntervalSince1970
+                    ts: Date().timeIntervalSince1970,
+                    harness: "opencode",
+                    model: details?.model,
+                    preview: preview
                 ))
-            }
-        } else if type == "session.created" {
-            if cwdCache.count > 200 { cwdCache.removeAll(); titleCache.removeAll() }
-            if let loc = payload["location"] as? [String: Any],
-               let dir = loc["directory"] as? String {
-                cwdCache[sessionID] = dir
             }
         } else if type == "session.renamed" {
             if let title = payload["title"] as? String, !title.isEmpty {
+                if titleCache.count > 200 && titleCache[sessionID] == nil { titleCache.removeAll() }
                 titleCache[sessionID] = title
             }
         } else if type == "session.usage.updated" {
@@ -277,11 +302,29 @@ final class OpencodeMonitor {
         }
     }
 
-    private static func fetchTitle(executable: String, sessionID: String) -> String? {
-        guard let obj = runJSON(executable, ["api", "get", "/api/session/\(sessionID)"]) else { return nil }
-        let session = (obj["data"] as? [String: Any]) ?? obj
-        guard let title = session["title"] as? String, !title.isEmpty else { return nil }
-        return title
+    private struct SessionDetails {
+        var title: String?
+        var model: String?
+        var prompt: String?     // newest user message
+    }
+
+    private static func fetchDetails(executable: String, sessionID: String) -> SessionDetails {
+        var details = SessionDetails()
+        if let obj = runJSON(executable, ["api", "get", "/api/session/\(sessionID)"]) {
+            let session = (obj["data"] as? [String: Any]) ?? obj
+            if let title = session["title"] as? String, !title.isEmpty { details.title = title }
+            if let model = session["model"] as? [String: Any],
+               let id = model["id"] as? String, !id.isEmpty { details.model = id }
+        }
+        // Messages come newest first, so the first user message is the latest prompt.
+        if let obj = runJSON(executable, ["api", "get", "/api/session/\(sessionID)/message"]),
+           let messages = obj["data"] as? [[String: Any]],
+           let user = messages.first(where: { ($0["type"] as? String) == "user" }),
+           let text = user["text"] as? String {
+            let flat = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+            if !flat.isEmpty { details.prompt = flat }
+        }
+        return details
     }
 
     private static func runJSON(_ executable: String, _ args: [String]) -> [String: Any]? {

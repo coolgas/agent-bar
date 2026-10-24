@@ -11,16 +11,6 @@ struct MenuView: View {
                 Text("AgentBar")
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
-                if model.runningCount > 0 {
-                    HStack(spacing: 3) {
-                        Image(systemName: "gearshape")
-                            .font(.caption2)
-                        Text("\(model.runningCount)")
-                            .font(.caption)
-                    }
-                    .foregroundStyle(.secondary)
-                    .help("running tasks")
-                }
                 Text(headerCountText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -100,6 +90,7 @@ struct MenuView: View {
             .padding(.vertical, 8)
         }
         .frame(width: 340)
+        .onAppear { store.pollNow() }
     }
 
     private var headerCountText: String {
@@ -130,19 +121,31 @@ struct EventRow: View {
                     .font(.system(size: 13))
                     .padding(.top, 1)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(event.cmd)
-                        .font(.system(size: 12, weight: acked ? .regular : .semibold))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
+                    HStack(spacing: 5) {
+                        Text(harness)
+                            .font(.system(size: 12, weight: acked ? .regular : .semibold))
+                        if let folder {
+                            Text(folder)
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(event.cwd ?? "")
+                        }
+                    }
+                    if let preview {
+                        Text(preview)
+                            .font(.system(size: 11))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
                     Text(subtitle)
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
                 Spacer(minLength: 0)
-                Text(sourceTag)
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(.tertiary)
-                    .padding(.top, 2)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 5)
@@ -170,12 +173,47 @@ struct EventRow: View {
 
     private var subtitle: String {
         var parts: [String] = []
+        if let model = event.model { parts.append(model) }
         if let d = durationText { parts.append(d) }
         parts.append(timeText)
-        if let cwd = event.cwd {
-            parts.append((cwd as NSString).lastPathComponent)
-        }
         return parts.joined(separator: "  ·  ")
+    }
+
+    // Shell events keep the raw command: first word is the tool, the rest is
+    // what it was asked to do. opencode events carry these fields directly.
+    private var commandWords: [Substring] {
+        var words = event.cmd.split(separator: " ", omittingEmptySubsequences: true)
+        while let first = words.first, first.contains("="), !first.hasPrefix("/") { words.removeFirst() }
+        return words
+    }
+
+    private var harness: String {
+        if let h = event.harness { return h }
+        if event.cmd.hasPrefix("opencode · ") { return "opencode" }
+        guard let first = commandWords.first else { return event.cmd }
+        return (String(first) as NSString).lastPathComponent
+    }
+
+    private var folder: String? {
+        guard let cwd = event.cwd, !cwd.isEmpty else { return nil }
+        if cwd == NSHomeDirectory() { return "~" }
+        return (cwd as NSString).lastPathComponent
+    }
+
+    private var preview: String? {
+        let text: String
+        if let p = event.preview {
+            text = p
+        } else if event.cmd.hasPrefix("opencode · ") {
+            text = String(event.cmd.dropFirst("opencode · ".count))
+        } else {
+            text = commandWords.dropFirst().joined(separator: " ")
+        }
+        let words = text.split(whereSeparator: { $0.isWhitespace })
+        guard !words.isEmpty else { return nil }
+        let limit = 6
+        let head = words.prefix(limit).joined(separator: " ")
+        return words.count > limit ? head + "…" : head
     }
 
     private var durationText: String? {
@@ -186,17 +224,12 @@ struct EventRow: View {
     }
 
     private var timeText: String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm"
-        return formatter.string(from: Date(timeIntervalSince1970: event.ts))
+        Self.timeFormatter.string(from: Date(timeIntervalSince1970: event.ts))
     }
 
-    private var sourceTag: String {
-        switch event.source {
-        case "zsh": return "zsh"
-        case "process": return "proc"
-        case "opencode": return "oc"
-        default: return event.source
-        }
-    }
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
 }

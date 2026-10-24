@@ -15,6 +15,7 @@ final class ProcessWatcher {
     // pid -> (command line, first word, elapsed seconds at last sighting)
     private var tracked: [pid_t: (cmd: String, base: String, elapsed: Int)] = [:]
     private var lastRunningCount = -1
+    private var scanInFlight = false
 
     /// Called on the main thread whenever the number of live watchlisted
     /// processes changes (drives the "running" counter in the UI).
@@ -41,18 +42,30 @@ final class ProcessWatcher {
         }
     }
 
+    /// Runs `ps` off the main thread (it can take tens of ms), then applies
+    /// the result on main where all watcher state lives.
     private func scan() {
-        let config = ConfigStore.shared.get()
-        let patterns = config.watchlist.filter { pattern in
+        guard !scanInFlight else { return }
+        scanInFlight = true
+        let patterns = ConfigStore.shared.get().watchlist.filter { pattern in
             let first = pattern.split(separator: " ").first.map(String.init) ?? pattern
             return first != "opencode"
         }
-        guard !patterns.isEmpty else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let lines = patterns.isEmpty ? [] : Self.runPS()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.scanInFlight = false
+                if self.timer != nil { self.apply(lines: lines, patterns: patterns) }
+            }
+        }
+    }
 
+    private func apply(lines: [String], patterns: [String]) {
         let me = getpid()
         var seen = Set<pid_t>()
 
-        for line in runPS() {
+        for line in lines {
             let parts = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
             guard parts.count >= 3,
                   let pid = pid_t(parts[0]),
@@ -89,19 +102,24 @@ final class ProcessWatcher {
 
     private func finish(_ info: (cmd: String, base: String, elapsed: Int)) {
         guard info.elapsed >= ConfigStore.shared.get().minDurationSec else { return }
-        // The zsh hook usually logs the same command with an exit code first;
-        // don't double-count it.
-        guard !store.hasRecentZshEvent(firstWord: info.base, within: 10) else { return }
-        EventStore.append(AgentEvent(
-            id: UUID().uuidString,
-            source: "process",
-            cmd: info.cmd,
-            exit: nil,
-            dur: info.elapsed,
-            cwd: nil,
-            tty: nil,
-            ts: Date().timeIntervalSince1970
-        ))
+        // The zsh hook logs the same command (with an exit code) the instant
+        // it exits, but the store only reads that line on its next 1s poll.
+        // Wait past that poll before deciding, otherwise we race it and
+        // double-count.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            guard let self else { return }
+            guard !self.store.hasRecentZshEvent(firstWord: info.base, within: 15) else { return }
+            EventStore.append(AgentEvent(
+                id: UUID().uuidString,
+                source: "process",
+                cmd: info.cmd,
+                exit: nil,
+                dur: info.elapsed,
+                cwd: nil,
+                tty: nil,
+                ts: Date().timeIntervalSince1970
+            ))
+        }
     }
 
     /// Prefix matching, mirroring the zsh hook semantics: "grok" matches
@@ -137,7 +155,7 @@ final class ProcessWatcher {
         return total + secs
     }
 
-    private func runPS() -> [String] {
+    private static func runPS() -> [String] {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/ps")
         p.arguments = ["ax", "-o", "pid=,etime=,args="]

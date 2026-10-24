@@ -9,14 +9,25 @@ final class EventStore: ObservableObject {
     @Published private(set) var events: [AgentEvent] = []
     @Published private(set) var acked: Set<String> = []
 
-    let dir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".agentbar", isDirectory: true)
+    /// The data directory: $AGENTBAR_HOME if set, else ~/.agentbar. The env
+    /// override makes it possible to test against a sandbox (and to keep
+    /// state somewhere else); Foundation ignores $HOME here, so it must be
+    /// explicit.
+    let dir = EventStore.dataDir
+
+    static var dataDir: URL {
+        if let custom = ProcessInfo.processInfo.environment["AGENTBAR_HOME"], !custom.isEmpty {
+            return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".agentbar", isDirectory: true)
+    }
 
     private var eventsURL: URL { dir.appendingPathComponent("events.jsonl") }
     private var ackedURL: URL { dir.appendingPathComponent("acked.json") }
 
     private var fileOffset: UInt64 = 0
-    private var pending = ""   // partial line carried between polls
+    private var pending = Data()   // partial line (raw bytes) carried between polls
     private var timer: Timer?
 
     var unackedCount: Int { events.lazy.filter { !self.acked.contains($0.id) }.count }
@@ -48,14 +59,20 @@ final class EventStore: ObservableObject {
     /// resets the count, and truncates the log file so the cleared history
     /// doesn't reappear on the next app launch.
     func clearAll() {
-        FileHandle.standardError.write(Data("[agentbar] clearAll: dropping \(events.count) events\n".utf8))
         events = []
         acked = []
         persistAcked()
-        try? FileManager.default.removeItem(at: eventsURL)
-        FileManager.default.createFile(atPath: eventsURL.path, contents: nil)
+        // Truncate in place rather than delete+recreate so a producer holding
+        // the file open keeps appending to the same inode.
+        if FileManager.default.fileExists(atPath: eventsURL.path),
+           let fh = try? FileHandle(forWritingTo: eventsURL) {
+            try? fh.truncate(atOffset: 0)
+            try? fh.close()
+        } else {
+            FileManager.default.createFile(atPath: eventsURL.path, contents: nil)
+        }
         fileOffset = 0
-        pending = ""
+        pending = Data()
     }
 
     private func loadAcked() {
@@ -72,16 +89,23 @@ final class EventStore: ObservableObject {
     // MARK: - File tailing
 
     private func reloadAll() {
-        pending = ""
+        pending = Data()
         guard let data = try? Data(contentsOf: eventsURL) else {
             events = []
             fileOffset = 0
             return
         }
-        fileOffset = UInt64(data.count)
-        events = Self.parse(data)
+        // Only consume complete lines. A trailing partial line (a producer
+        // mid-write) stays unread so the next poll picks it up whole.
+        let end = data.lastIndex(of: 0x0A).map { data.distance(from: data.startIndex, to: $0) + 1 } ?? 0
+        fileOffset = UInt64(end)
+        events = Self.parse(data.prefix(end))
         trim()
     }
+
+    /// Reads any newly appended events immediately (used when the panel opens
+    /// so it never shows data up to a second stale).
+    func pollNow() { poll() }
 
     private func poll() {
         let attrs = try? FileManager.default.attributesOfItem(atPath: eventsURL.path)
@@ -99,35 +123,32 @@ final class EventStore: ObservableObject {
         try? fh.seek(toOffset: fileOffset)
         let data = fh.readDataToEndOfFile()
         fileOffset = UInt64(fh.offsetInFile)
-        consumeChunk(String(decoding: data, as: UTF8.self))
+        consumeChunk(data)
     }
 
-    private func consumeChunk(_ text: String) {
-        pending += text
-        var lines = pending.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
-        if !pending.hasSuffix("\n"), let last = lines.popLast() {
-            pending = last   // incomplete line; wait for the rest
-        } else {
-            pending = ""
-        }
-        let parsed = lines.compactMap(Self.parseLine)
+    /// Splits on raw newline bytes *before* decoding, so a multi-byte UTF-8
+    /// character straddling two reads is never torn in half.
+    private func consumeChunk(_ chunk: Data) {
+        pending.append(chunk)
+        guard let lastNL = pending.lastIndex(of: 0x0A) else { return }
+        let complete = pending[pending.startIndex...lastNL]
+        pending = Data(pending[pending.index(after: lastNL)...])
+        let parsed = Self.parse(complete)
         guard !parsed.isEmpty else { return }
-        events.append(contentsOf: parsed)
+        // Ignore ids we already hold (e.g. a re-read after a truncation race).
+        let known = Set(events.map(\.id))
+        let fresh = parsed.filter { !known.contains($0.id) }
+        guard !fresh.isEmpty else { return }
+        events.append(contentsOf: fresh)
         trim()
     }
 
     private static func parse(_ data: Data) -> [AgentEvent] {
-        String(decoding: data, as: UTF8.self)
-            .split(separator: "\n")
-            .compactMap { parseLine(String($0)) }
+        data.split(separator: 0x0A).compactMap { parseLine(Data($0)) }
     }
 
-    private static func parseLine(_ raw: String) -> AgentEvent? {
-        let line = raw.trimmingCharacters(in: .whitespaces)
-        guard line.hasPrefix("{"),
-              let data = line.data(using: .utf8),
-              let event = try? JSONDecoder().decode(AgentEvent.self, from: data) else { return nil }
-        return event
+    private static func parseLine(_ data: Data) -> AgentEvent? {
+        try? JSONDecoder().decode(AgentEvent.self, from: data)
     }
 
     private func trim() {
@@ -150,9 +171,10 @@ final class EventStore: ObservableObject {
     func hasRecentZshEvent(firstWord word: String, within seconds: Double) -> Bool {
         let now = Date().timeIntervalSince1970
         return events.contains { event in
-            event.source == "zsh"
-                && (now - event.ts) <= seconds
-                && (event.cmd.split(separator: " ").first.map(String.init) ?? "") == word
+            guard event.source == "zsh", (now - event.ts) <= seconds,
+                  let first = event.cmd.split(whereSeparator: { $0 == " " || $0 == "\t" }).first
+            else { return false }
+            return (String(first) as NSString).lastPathComponent == word
         }
     }
 
@@ -160,18 +182,24 @@ final class EventStore: ObservableObject {
     /// call this from any queue. The EventStore instance picks it up on its
     /// next 1-second poll.
     static func append(_ event: AgentEvent) {
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".agentbar", isDirectory: true)
+        let dir = dataDir
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent("events.jsonl")
         guard var data = try? JSONEncoder().encode(event) else { return }
         data.append(0x0A)
-        if !FileManager.default.fileExists(atPath: url.path) {
-            FileManager.default.createFile(atPath: url.path, contents: nil)
+        // O_APPEND makes each write() land atomically at end-of-file, so it
+        // can't interleave with the zsh hook (or another producer) appending
+        // at the same moment, unlike a separate seekToEnd() + write().
+        let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        data.withUnsafeBytes { buf in
+            var offset = 0
+            while offset < buf.count {
+                let n = write(fd, buf.baseAddress!.advanced(by: offset), buf.count - offset)
+                if n < 0 { if errno == EINTR { continue }; return }
+                offset += n
+            }
         }
-        guard let fh = try? FileHandle(forWritingTo: url) else { return }
-        defer { try? fh.close() }
-        _ = try? fh.seekToEnd()
-        try? fh.write(contentsOf: data)
     }
 }

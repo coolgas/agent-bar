@@ -11,6 +11,9 @@ struct AgentEvent: Codable, Identifiable, Equatable {
     var cwd: String?
     var tty: String?
     var ts: Double          // epoch seconds
+    var harness: String? = nil   // "opencode"; nil = derive from cmd
+    var model: String? = nil     // model id the agent ran with, when known
+    var preview: String? = nil   // first words of the prompt; nil = derive from cmd
 }
 
 struct Config {
@@ -35,20 +38,28 @@ struct Config {
     /// Blank lines and # comments are ignored. If the file defines any
     /// "watch" lines they replace the built-in defaults entirely.
     static func load() -> Config {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return Config() }
+        return parse(text)
+    }
+
+    static func parse(_ text: String) -> Config {
         var config = Config()
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return config }
         var watches: [String] = []
-        for rawLine in text.split(separator: "\n") {
-            let line = rawLine.split(separator: "#", maxSplits: 1).first.map(String.init) ?? ""
+        for rawLine in text.split(whereSeparator: \.isNewline) {
+            // omittingEmptySubsequences must be false: otherwise a line that
+            // *starts* with "#" yields its remainder as the first piece and
+            // commented-out directives get treated as live ones.
+            let line = rawLine.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
+                .first.map(String.init) ?? ""
             let tokens = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
             guard !tokens.isEmpty else { continue }
             switch tokens[0] {
             case "watch" where tokens.count >= 2:
                 watches.append(tokens.dropFirst().joined(separator: " "))
             case "minDurationSec" where tokens.count >= 2:
-                if let n = Int(tokens[1]) { config.minDurationSec = n }
+                if let n = Int(tokens[1]), n >= 0 { config.minDurationSec = n }
             case "maxEvents" where tokens.count >= 2:
-                if let n = Int(tokens[1]) { config.maxEvents = n }
+                if let n = Int(tokens[1]), n > 0 { config.maxEvents = n }
             default:
                 break
             }
